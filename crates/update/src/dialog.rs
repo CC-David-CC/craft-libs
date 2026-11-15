@@ -477,8 +477,9 @@ impl CheckResultDialog {
                             }
                             Status::Failed(error) => {
                                 ui.label(RichText::new(t("Could not check for updates.", &[])).size(12.5).strong().color(alert));
+                                let details = t("Details: {error}", &[("error", error)]);
                                 bounded(ui, "craft_update.check_failure", |ui| {
-                                    ui.add(egui::Label::new(RichText::new(error).size(12.0).color(text_muted)).selectable(true));
+                                    ui.add(egui::Label::new(RichText::new(details).size(12.0).color(text_muted)).selectable(true));
                                 });
                                 ui.label(
                                     RichText::new(t("All releases are listed at {url}", &[("url", &self.app.releases_url())]))
@@ -1194,7 +1195,7 @@ mod tests {
     }
 
     /// Each painted line of a translated card is the app's (bracketed), or a value the card
-    /// doesn't translate (the badge initial, the app name, an error).
+    /// doesn't translate (the badge initial, the app name or a version).
     fn assert_all_translated(painted: &str, untranslated: &[&str]) {
         for line in painted.lines() {
             assert!(line.starts_with('[') || untranslated.contains(&line), "{line:?} is not translated in {painted:?}");
@@ -1245,8 +1246,11 @@ mod tests {
                 output = Some(out);
             }
             let painted = output.map(|o| painted_text(&o)).unwrap_or_default();
-            // The version line is a number, and a failure's reason comes from the network as it is.
-            assert_all_translated(&painted, &["P", "PhotoCraft", "v0.1.0", "no network"]);
+            // The version line is a number. Diagnostic values belong inside a translated template.
+            assert_all_translated(&painted, &["P", "PhotoCraft", "v0.1.0"]);
+            if matches!(status, Status::Failed(_)) {
+                assert!(painted.contains("[no network | Details: ]"), "the diagnostic must survive translation: {painted}");
+            }
             assert!(painted.contains("[ArtCraft | by ]"), "{painted}");
         }
     }
