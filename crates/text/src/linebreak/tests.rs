@@ -91,9 +91,11 @@ fn every_line(items: &[Item], width: f64, ragged: bool) -> Vec<Line> {
     let p = vectorcraft(ragged);
     let w = |_| width;
     let loose = if ragged { f64::INFINITY } else { 4.0 };
-    knuth_plass(items, &w, &Params { tolerance: 1.0, ..p })
-        .or_else(|| knuth_plass(items, &w, &Params { tolerance: loose, ..p }))
-        .unwrap_or_else(|| greedy(items, &w, &p))
+    // Build both passes outside the closure: Rust 1.95's borrow checker crashes
+    // on the Tiers array alias in a captured Params struct-update expression.
+    let strict = Params { tolerance: 1.0, ..p };
+    let relaxed = Params { tolerance: loose, ..p };
+    knuth_plass(items, &w, &strict).or_else(|| knuth_plass(items, &w, &relaxed)).unwrap_or_else(|| greedy(items, &w, &p))
 }
 
 fn designcraft(ragged: bool) -> Params {
