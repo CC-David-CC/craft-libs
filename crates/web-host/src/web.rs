@@ -15,7 +15,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::js_sys;
 
 use crate::{
-    Inbox, Incoming, MAX_SAVE_ERROR_CHARS, MAX_SAVE_ID_CHARS, Mode, Outgoing, SaveContext, SaveFailureKind, VERSION, file_name, message_type,
+    Inbox, Incoming, MAX_SAVE_ERROR_CHARS, MAX_SAVE_ID_CHARS, Mode, OpenResult, Outgoing, SaveContext, SaveFailureKind, VERSION, file_name,
+    message_type,
 };
 
 /// A file the host passes in, not yet copied into the app's memory: check its size first.
@@ -42,6 +43,8 @@ pub enum Message {
     Host { version: String, handoff: bool },
     /// Open a document as File › Open would. `name` is already cleaned ([`crate::file_name`]).
     Open { name: String, data: FileData },
+    /// An open carrying a validated correlation id; completion must name the resulting editor document.
+    IdentifiedOpen { id: String, name: String, data: FileData },
     /// The save with this `id` is stored.
     Saved { id: String },
     /// A correlated, explicit non-confirmed outcome. Unknown may have committed; never replay it blindly.
@@ -140,7 +143,17 @@ impl Host {
     /// The app is listening: send a document now. `app_version` is the app's own release;
     /// `reads_files`: it takes a `File`/`Blob` and reads it in slices.
     pub fn post_ready(&self, app_version: &str, reads_files: bool) -> Result<(), String> {
-        self.post(Outgoing::Ready, &[("version", VERSION.into()), ("appVersion", app_version.into()), ("file", reads_files.into())], None)
+        self.post(Outgoing::Ready, &ready_fields(app_version, reads_files, false), None)
+    }
+
+    /// Advertise only after wiring identified opens to their actual successful/error outcomes.
+    pub fn post_ready_with_open_results(&self, app_version: &str, reads_files: bool) -> Result<(), String> {
+        self.post(Outgoing::Ready, &ready_fields(app_version, reads_files, true), None)
+    }
+
+    /// Report successful native adoption, never merely receipt or dispatch of bytes.
+    pub fn post_opened(&self, result: &OpenResult<'_>) -> Result<(), String> {
+        self.post(Outgoing::Opened, &opened_fields(result)?, None)
     }
 
     /// Unsaved changes appeared or went away. Repeats of the last state reported are not sent.
@@ -203,6 +216,24 @@ impl Host {
     }
 }
 
+fn ready_fields(app_version: &str, reads_files: bool, open_results: bool) -> Vec<(&'static str, JsValue)> {
+    let mut fields = vec![("version", VERSION.into()), ("appVersion", app_version.into()), ("file", reads_files.into())];
+    if open_results {
+        fields.push(("openResult", true.into()));
+    }
+    fields
+}
+
+fn opened_fields(result: &OpenResult<'_>) -> Result<Vec<(&'static str, JsValue)>, String> {
+    result.validate().map_err(str::to_string)?;
+    Ok(vec![
+        ("id", result.id.into()),
+        ("documentId", result.document_id.into()),
+        ("revision", result.revision.into()),
+        ("sourceRetained", result.source_retained.into()),
+    ])
+}
+
 struct SavePacket {
     buffer: js_sys::ArrayBuffer,
     fields: Vec<(&'static str, JsValue)>,
@@ -230,7 +261,10 @@ fn save_packet(name: &str, bytes: &[u8], id: Option<&str>, save_as: bool, contex
 
 /// Bound JS strings before allocating a Rust copy (UTF-16 has at most two units per scalar).
 fn bounded_string(data: &JsValue, key: &str, max: usize) -> Option<String> {
-    let value = get(data, key);
+    bounded_string_value(get(data, key), max)
+}
+
+fn bounded_string_value(value: JsValue, max: usize) -> Option<String> {
     if !value.is_string() {
         return None;
     }
@@ -250,8 +284,22 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
             handoff: get(data, "handoff").as_bool() == Some(true),
         },
         Incoming::Open => {
+            let raw_id = get(data, "id");
+            let id = if raw_id.is_undefined() {
+                None
+            } else {
+                let id = bounded_string_value(raw_id, MAX_SAVE_ID_CHARS)?;
+                if !crate::save::valid_save_id(&id) {
+                    return None;
+                }
+                Some(id)
+            };
             let name = file_name(string(data, "name").as_deref(), "document");
-            Message::Open { name, data: file_data(data)? }
+            let data = file_data(data)?;
+            match id {
+                Some(id) => Message::IdentifiedOpen { id, name, data },
+                None => Message::Open { name, data },
+            }
         }
         Incoming::Saved => Message::Saved { id: string(data, "id")? },
         Incoming::SaveFailed => {
@@ -314,6 +362,37 @@ mod tests {
 
     fn buffer(len: u32) -> js_sys::ArrayBuffer {
         js_sys::ArrayBuffer::new(len)
+    }
+
+    #[wasm_bindgen_test]
+    fn identified_open_requires_valid_id_and_does_not_fall_back_to_untracked_open() {
+        let data = obj(&[("id", "load-1".into()), ("name", "a.deckcraft".into()), ("bytes", buffer(3).into())]);
+        assert!(
+            matches!(read(Incoming::Open,&data),Some(Message::IdentifiedOpen {id,name,data}) if id=="load-1"&&name=="a.deckcraft"&&data.size()==3.0)
+        );
+        for id in [JsValue::NULL, 7.into(), "".into(), "bad\nid".into(), "x".repeat(MAX_SAVE_ID_CHARS + 1).into()] {
+            assert!(read(Incoming::Open, &obj(&[("id", id), ("bytes", buffer(3).into())])).is_none());
+        }
+        assert!(matches!(read(Incoming::Open, &obj(&[("bytes", buffer(3).into())])), Some(Message::Open { .. })));
+    }
+
+    #[wasm_bindgen_test]
+    fn opened_result_carries_actual_identity_and_explicit_source_retention() {
+        for source_retained in [true, false] {
+            let result = OpenResult { id: "load-1", document_id: "doc-7", revision: "rev-4", source_retained };
+            let data = obj(&opened_fields(&result).expect("valid opened result"));
+            assert_eq!(string(&data, "id").as_deref(), Some("load-1"));
+            assert_eq!(string(&data, "documentId").as_deref(), Some("doc-7"));
+            assert_eq!(string(&data, "revision").as_deref(), Some("rev-4"));
+            assert_eq!(get(&data, "sourceRetained").as_bool(), Some(source_retained));
+            assert!(opened_fields(&OpenResult { document_id: "", ..result }).is_err());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn correlated_open_advertisement_is_opt_in() {
+        assert!(get(&obj(&ready_fields("1.0", false, false)), "openResult").is_undefined());
+        assert_eq!(get(&obj(&ready_fields("1.0", false, true)), "openResult").as_bool(), Some(true));
     }
 
     #[wasm_bindgen_test]

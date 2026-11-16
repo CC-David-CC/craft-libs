@@ -73,3 +73,20 @@ letters, digits, periods, underscores or hyphens. Failure diagnostics are limite
 to 1024 Unicode scalars. Old save envelopes remain unchanged, but Rust consumers
 matching `Incoming` or `Message` exhaustively must handle the new failure variant
 when updating their dependency.
+
+## Correlated binary opens
+
+A bridge with completed/error native adoption wiring calls
+`post_ready_with_open_results`, advertising `ready.openResult: true`. The host
+may then include a bounded `id` with the existing binary `open` message. The
+bridge receives `Message::IdentifiedOpen`; malformed explicit IDs are dropped,
+never converted into an untracked open. Old opens without IDs remain unchanged.
+
+After actual successful adoption, call `post_opened(&OpenResult { ... })` with
+the captured editor document ID/revision and `source_retained`. This flag is
+false for repaired/converted/unnamed copies that must not overwrite the original
+account resource. Errors use the existing app-to-host `failed {id,error}`.
+Receipt/dispatch is not successful adoption. Bind the request ID to the host's
+captured instance/session/account path/server revision; editor identities are
+not authorization grants. Do not blindly replay an unconfirmed open. Existing
+Rust exhaustive matches must deliberately handle the new enum variants.

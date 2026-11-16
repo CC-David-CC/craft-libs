@@ -8,7 +8,8 @@
 //! |---|---|---|
 //! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices) |
 //! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs) |
-//! | `open` | host → app | `name`, and `bytes` or `file` + `size` |
+//! | `open` | host → app | `id?`, `name`, and `bytes` or `file` + `size` |
+//! | `opened` | app → host | `id`, `documentId`, `revision`, `sourceRetained` |
 //! | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` |
 //! | `saved` | host → app | `id` |
 //! | `save-failed` | host → app | `id`, `outcome` (`failed/cancelled/conflict/unknown`), `error` |
@@ -17,6 +18,8 @@
 //! | `handoff` | app → host | `name`, and `bytes` or `file` + `size` |
 //! | `handoff-done` | host → app | `name`, `app` |
 //!
+//! An app advertises `ready.openResult: true` only when it returns correlated open outcomes.
+//! Opening creates editor state, not an account authorization or storage confirmation.
 //! A host answers `saved` only after durable storage of a `save` carrying an `id`.
 //! A successful post is delivery acceptance, not persistence. Identified saves additionally
 //! carry `documentId`, `revision`, `operation` and `documentSave` from [`SaveContext`].
@@ -30,6 +33,9 @@
 //! itself and builds everywhere; [`web`] (wasm32 only) is the bridge an app's web shell calls.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+mod open;
+pub use open::OpenResult;
 
 mod save;
 pub use save::{MAX_SAVE_ERROR_CHARS, MAX_SAVE_ID_CHARS, SaveContext, SaveFailureKind};
@@ -76,6 +82,7 @@ impl Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outgoing {
     Ready,
+    Opened,
     Save,
     Dirty,
     Failed,
@@ -96,6 +103,7 @@ impl Outgoing {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Ready => "ready",
+            Self::Opened => "opened",
             Self::Save => "save",
             Self::Dirty => "dirty",
             Self::Failed => "failed",
