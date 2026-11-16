@@ -11,13 +11,16 @@
 //! | `open` | host → app | `name`, and `bytes` or `file` + `size` |
 //! | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` |
 //! | `saved` | host → app | `id` |
+//! | `save-failed` | host → app | `id`, `outcome` (`failed/cancelled/conflict/unknown`), `error` |
 //! | `dirty` | app → host | `dirty` |
 //! | `failed` | app → host | `error`, `id?` |
 //! | `handoff` | app → host | `name`, and `bytes` or `file` + `size` |
 //! | `handoff-done` | host → app | `name`, `app` |
 //!
-//! A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats a
-//! save as done once it is posted. Fields marked `?` are optional, so the bridges shipped before
+//! A host answers `saved` only after durable storage of a `save` carrying an `id`.
+//! A successful post is delivery acceptance, not persistence. Identified saves additionally
+//! carry `documentId`, `revision`, `operation` and `documentSave` from [`SaveContext`].
+//! The host maps these editor identities to authorized account resources; they grant no access. Fields marked `?` are optional, so the bridges shipped before
 //! this crate already speak version 1. Those bridges put the app's own release in `ready`'s
 //! `version` (`"0.14.0"`): a host treats any `version` it doesn't know as `"1"`.
 //!
@@ -27,6 +30,9 @@
 //! itself and builds everywhere; [`web`] (wasm32 only) is the bridge an app's web shell calls.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+mod save;
+pub use save::{MAX_SAVE_ERROR_CHARS, MAX_SAVE_ID_CHARS, SaveContext, SaveFailureKind};
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -82,6 +88,7 @@ pub enum Incoming {
     Host,
     Open,
     Saved,
+    SaveFailed,
     HandoffDone,
 }
 
@@ -98,13 +105,14 @@ impl Outgoing {
 }
 
 impl Incoming {
-    pub const ALL: [Self; 4] = [Self::Host, Self::Open, Self::Saved, Self::HandoffDone];
+    pub const ALL: [Self; 5] = [Self::Host, Self::Open, Self::Saved, Self::SaveFailed, Self::HandoffDone];
 
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Host => "host",
             Self::Open => "open",
             Self::Saved => "saved",
+            Self::SaveFailed => "save-failed",
             Self::HandoffDone => "handoff-done",
         }
     }

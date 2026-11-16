@@ -15,7 +15,8 @@ The crate has two parts:
 | `host` | host → app | `version`, `handoff?` | what the host supports; `handoff: true` means it routes hand-offs |
 | `open` | host → app | `name`, and `bytes` or `file` + `size` | open a document as File › Open would |
 | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` | Save, Save As or Export: the host stores the file |
-| `saved` | host → app | `id` | the save with that `id` is stored; the app clears dirty |
+| `saved` | host → app | `id` | the captured save is durable; the app reconciles that revision without clearing newer edits |
+| `save-failed` | host → app | `id`, `outcome`, `error` | explicit `failed`, `cancelled`, `conflict` or `unknown` outcome |
 | `dirty` | app → host | `dirty` | unsaved changes appeared or went away |
 | `failed` | app → host | `error`, `id?` | a document or a save could not be taken |
 | `handoff` | app → host | `name`, and `bytes` or `file` + `size` | this file belongs to another app |
@@ -25,7 +26,7 @@ With `?host=parent` a message is an object with `type` (`pdfcraft:open`) and the
 
 Compatibility with the bridges shipped before this crate:
 
-- Fields marked `?` are optional. A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats its save as done once it is posted.
+- Fields marked `?` are optional. A host answers `saved` only for a `save` that carries an `id`; posting without an ID provides no durability confirmation.
 - A host that never sends `host` gets the behaviour of the earlier bridges.
 - `size` beside `file` is for hosts and older bridges; this crate takes a `Blob`'s length from the `Blob` itself.
 - A page host may dispatch an event while the app's handler runs (a `saved` answering the `save` it just posted). The bridge holds it and calls the handler again once the running call returns, so messages arrive one at a time and in order.
@@ -49,3 +50,26 @@ if let Some(host) = craft_web_host::web::Host::connect("pdfcraft", &canvas) {
 ```
 
 The page command API is [`craft-web-api`](../web-api/README.md) (storytold/craft-libs#413): `window.<app>.request` and the command functions. It sits beside these messages. Opening, saving, the document name and the dirty flag stay here.
+
+## Identified saves
+
+`Host::post_identified_save(name, bytes, save_as, &SaveContext { ... })` adds
+`documentId`, `revision`, `operation` and `documentSave` to the existing save envelope.
+Capture these values when serializing. The editor revision is not a server revision;
+the host must bind the request to its authorized instance, session and account resource.
+The filename and identity strings grant no access. `documentSave` is false for exports,
+even when the exported filename resembles the source filename.
+
+A successful post only accepts dispatch. Match `Saved` or `SaveFailed` by request ID,
+then reconcile the captured document, preserving subsequent edits. Failure replies need
+an explicit outcome and a bounded diagnostic free of credentials. `Unknown` means the
+mutation may have committed: retain its identity and reconcile rather than blindly retry.
+Missing or unrecognized outcomes are dropped, never inferred as success or known failure.
+The original `post_save` API remains available for existing consumers.
+
+Request, document and editor-revision identities are nonempty, contain no control
+characters and are limited to 128 Unicode scalars. Operations are 1–64 ASCII
+letters, digits, periods, underscores or hyphens. Failure diagnostics are limited
+to 1024 Unicode scalars. Old save envelopes remain unchanged, but Rust consumers
+matching `Incoming` or `Message` exhaustively must handle the new failure variant
+when updating their dependency.

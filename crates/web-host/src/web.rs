@@ -14,7 +14,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::js_sys;
 
-use crate::{Inbox, Incoming, Mode, Outgoing, VERSION, file_name, message_type};
+use crate::{
+    Inbox, Incoming, MAX_SAVE_ERROR_CHARS, MAX_SAVE_ID_CHARS, Mode, Outgoing, SaveContext, SaveFailureKind, VERSION, file_name, message_type,
+};
 
 /// A file the host passes in, not yet copied into the app's memory: check its size first.
 pub enum FileData {
@@ -42,6 +44,8 @@ pub enum Message {
     Open { name: String, data: FileData },
     /// The save with this `id` is stored.
     Saved { id: String },
+    /// A correlated, explicit non-confirmed outcome. Unknown may have committed; never replay it blindly.
+    SaveFailed { id: String, outcome: SaveFailureKind, error: String },
     /// The host gave a handed-off file to the app that edits it.
     HandoffDone { name: String, app: String },
 }
@@ -146,17 +150,18 @@ impl Host {
         crate::note_dirty(&self.dirty, dirty, || self.post(Outgoing::Dirty, &[("dirty", dirty.into())], None).is_ok());
     }
 
-    /// Hand the host a file the app would otherwise download: Save, Save As, Export. With an
-    /// `id`, the host answers [`Message::Saved`] once it is stored; without one the save is done
-    /// once it is posted. The bytes go as a transferred `ArrayBuffer`.
+    /// Dispatch bytes, optionally correlated by id. Ok means delivery acceptance, not a save.
+    /// Account-backed document saves should use `post_identified_save` and wait for a result.
     pub fn post_save(&self, name: &str, bytes: &[u8], id: Option<&str>, save_as: bool) -> Result<(), String> {
-        let buffer = js_sys::Uint8Array::from(bytes).buffer();
-        let mut fields =
-            vec![("name", JsValue::from(file_name(Some(name), "document"))), ("bytes", buffer.clone().into()), ("saveAs", save_as.into())];
-        if let Some(id) = id {
-            fields.push(("id", id.into()));
-        }
-        self.post(Outgoing::Save, &fields, Some(&buffer))
+        let packet = save_packet(name, bytes, id, save_as, None)?;
+        self.post(Outgoing::Save, &packet.fields, Some(&packet.buffer))
+    }
+
+    /// Dispatch a serialized editor version with explicit identity and document/export intent.
+    /// Neither this context nor the same-origin transport is an authorization grant.
+    pub fn post_identified_save(&self, name: &str, bytes: &[u8], save_as: bool, context: &SaveContext<'_>) -> Result<(), String> {
+        let packet = save_packet(name, bytes, None, save_as, Some(context))?;
+        self.post(Outgoing::Save, &packet.fields, Some(&packet.buffer))
     }
 
     /// The app couldn't start, couldn't take a document, or a save went unconfirmed (`id`).
@@ -198,6 +203,45 @@ impl Host {
     }
 }
 
+struct SavePacket {
+    buffer: js_sys::ArrayBuffer,
+    fields: Vec<(&'static str, JsValue)>,
+}
+
+fn save_packet(name: &str, bytes: &[u8], id: Option<&str>, save_as: bool, context: Option<&SaveContext<'_>>) -> Result<SavePacket, String> {
+    if let Some(context) = context {
+        context.validate().map_err(str::to_string)?;
+    }
+    let buffer = js_sys::Uint8Array::from(bytes).buffer();
+    let mut fields = vec![("name", file_name(Some(name), "document").into()), ("bytes", buffer.clone().into()), ("saveAs", save_as.into())];
+    if let Some(id) = context.map(|context| context.id).or(id) {
+        fields.push(("id", id.into()));
+    }
+    if let Some(context) = context {
+        fields.extend([
+            ("documentId", context.document_id.into()),
+            ("revision", context.revision.into()),
+            ("operation", context.operation.into()),
+            ("documentSave", context.document_save.into()),
+        ]);
+    }
+    Ok(SavePacket { buffer, fields })
+}
+
+/// Bound JS strings before allocating a Rust copy (UTF-16 has at most two units per scalar).
+fn bounded_string(data: &JsValue, key: &str, max: usize) -> Option<String> {
+    let value = get(data, key);
+    if !value.is_string() {
+        return None;
+    }
+    let js = js_sys::JsString::from(value);
+    if usize::try_from(js.length()).ok()? > max.saturating_mul(2) {
+        return None;
+    }
+    let text = js.as_string()?;
+    (text.chars().count() <= max).then_some(text)
+}
+
 /// The message a host's object describes, or `None` when a required field is missing.
 fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
     Some(match kind {
@@ -210,6 +254,15 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
             Message::Open { name, data: file_data(data)? }
         }
         Incoming::Saved => Message::Saved { id: string(data, "id")? },
+        Incoming::SaveFailed => {
+            let id = bounded_string(data, "id", MAX_SAVE_ID_CHARS)?;
+            if !crate::save::valid_save_id(&id) {
+                return None;
+            }
+            let outcome = SaveFailureKind::parse(&bounded_string(data, "outcome", 16)?)?;
+            let error = bounded_string(data, "error", MAX_SAVE_ERROR_CHARS)?;
+            Message::SaveFailed { id, outcome, error }
+        }
         Incoming::HandoffDone => {
             Message::HandoffDone { name: string(data, "name").unwrap_or_default(), app: string(data, "app").unwrap_or_default() }
         }
@@ -261,6 +314,51 @@ mod tests {
 
     fn buffer(len: u32) -> js_sys::ArrayBuffer {
         js_sys::ArrayBuffer::new(len)
+    }
+
+    #[wasm_bindgen_test]
+    fn identified_saves_capture_context_and_preserve_bytes() {
+        let context = SaveContext { id: "request-2", document_id: "doc-9", revision: "17", operation: "file.exportPdf", document_save: false };
+        let packet = save_packet("report.pdf", &[0, 12, 255], None, true, Some(&context)).expect("valid context");
+        let data = obj(&packet.fields);
+        for (key, value) in [("id", "request-2"), ("documentId", "doc-9"), ("revision", "17"), ("operation", "file.exportPdf")] {
+            assert_eq!(string(&data, key).as_deref(), Some(value));
+        }
+        assert_eq!(get(&data, "documentSave").as_bool(), Some(false));
+        assert_eq!(get(&data, "saveAs").as_bool(), Some(true));
+        assert_eq!(js_sys::Uint8Array::new(&packet.buffer).to_vec(), vec![0, 12, 255]);
+        assert!(save_packet("report.pdf", &[], None, false, Some(&SaveContext { id: "", ..context })).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn legacy_saves_do_not_invent_document_context() {
+        let packet = save_packet("a.txt", &[1], Some("legacy"), false, None).expect("legacy save");
+        let data = obj(&packet.fields);
+        assert_eq!(string(&data, "id").as_deref(), Some("legacy"));
+        for key in ["documentId", "revision", "operation", "documentSave"] {
+            assert!(get(&data, key).is_undefined());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn failure_messages_require_explicit_bounded_outcomes() {
+        let failure = |id: JsValue, outcome: JsValue, error: JsValue| obj(&[("id", id), ("outcome", outcome), ("error", error)]);
+        for kind in [SaveFailureKind::Failed, SaveFailureKind::Cancelled, SaveFailureKind::Conflict, SaveFailureKind::Unknown] {
+            assert!(matches!(read(Incoming::SaveFailed, &failure("r1".into(), kind.as_str().into(), "diagnostic".into())),
+                Some(Message::SaveFailed { id, outcome, error }) if id == "r1" && outcome == kind && error == "diagnostic"));
+        }
+        for invalid in [JsValue::UNDEFINED, 3.into(), "".into(), "saved".into(), "timeout".into(), "UNKNOWN".into()] {
+            assert!(read(Incoming::SaveFailed, &failure("r1".into(), invalid, "".into())).is_none());
+        }
+        for invalid in [JsValue::UNDEFINED, 3.into(), "".into(), "a\nb".into(), "x".repeat(MAX_SAVE_ID_CHARS + 1).into()] {
+            assert!(read(Incoming::SaveFailed, &failure(invalid, "failed".into(), "".into())).is_none());
+        }
+        for invalid in [JsValue::UNDEFINED, 3.into(), "x".repeat(MAX_SAVE_ERROR_CHARS + 1).into()] {
+            assert!(read(Incoming::SaveFailed, &failure("r1".into(), "failed".into(), invalid)).is_none());
+        }
+        let unicode = "😀".repeat(MAX_SAVE_ERROR_CHARS);
+        assert!(read(Incoming::SaveFailed, &failure("r1".into(), "unknown".into(), unicode.into())).is_some());
+        assert!(read(Incoming::SaveFailed, &JsValue::NULL).is_none());
     }
 
     #[wasm_bindgen_test]
