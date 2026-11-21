@@ -463,7 +463,8 @@ pub(crate) fn run<C: Component>(
     let commit_now = step.commit_now || (was_focused && left_for_part);
     // Focus back from the edit menu finds the selection the part held for it, which the adapter put back.
     let back_from_menu = menu_held && state.held_selection.is_none();
-    if out.focused && !left_for_part && !was_focused && !back_from_menu {
+    // Input can arrive on the first focused pass. Keep the caret that handled that edit.
+    if out.focused && !left_for_part && !was_focused && !back_from_menu && !state.dirty {
         let len = decl.shown.chars().count();
         // A dialog that opens on this field selects its whole text whatever the codec's caret, so typing replaces it
         // (photocraft#15540).

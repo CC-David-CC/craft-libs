@@ -68,3 +68,25 @@ fn a_letter_typed_into_a_field_is_its_own() {
     assert_eq!(*text.borrow(), "t", "the field gets the text");
     assert!(!app_read.borrow().contains(&Key::T), "and the app reads no press of it");
 }
+
+
+/// Text delivered during a focus change must keep its insertion point on the next pass.
+#[trial]
+fn immediate_typing_after_focus_keeps_caret_after_inserted_text() {
+    let value = Rc::new(RefCell::new(String::new()));
+    let shown = value.clone();
+    let mut fixture = Fixture::new(move |ui| {
+        TextField::search("Query", Bind::bound(&mut *shown.borrow_mut())).show(ui);
+    });
+    fixture.settle();
+    fixture.key(Key::Tab, Modifiers::NONE);
+    fixture.settle();
+    let widget = fixture.ctx().memory(|mem| mem.focused()).expect("field has keyboard focus");
+    fixture.ctx().memory_mut(|mem| mem.surrender_focus(widget));
+    fixture.idle(2);
+    fixture.ctx().memory_mut(|mem| mem.request_focus(widget));
+    fixture.type_text("Edit");
+    fixture.type_text(" Contents");
+    fixture.idle(2);
+    assert_eq!(*value.borrow(), "Edit Contents");
+}
